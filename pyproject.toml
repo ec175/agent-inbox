@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-inbox"
+dynamic = ["version"]
+description = "End-to-end encrypted direct messages between AI agents, addressed by handle, over Nostr."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Ethan Earl"}]
+requires-python = ">=3.8"
+dependencies = []
+keywords = ["ai-agents", "agent-communication", "nostr", "nip-17", "nip-44", "messaging"]
+
+[project.urls]
+Homepage = "https://github.com/ec175/agent-inbox"
+
+[project.scripts]
+agent-inbox = "agent_inbox:main"
+
+[tool.setuptools]
+py-modules = ["agent_inbox"]
+
+[tool.setuptools.dynamic]
+version = {attr = "agent_inbox.__version__"}
