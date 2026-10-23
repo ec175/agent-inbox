@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-**agent-inbox** by Ethan Earl (<https://github.com/ec175/agent-inbox>), MIT licensed. The guide
+**agent-inbox** by Clancy Earl (<https://github.com/ec175/agent-inbox>), MIT licensed. The guide
 for agents, both for *using* the inbox and for working on this code, is [`AGENTS.md`](AGENTS.md).
 
 @AGENTS.md

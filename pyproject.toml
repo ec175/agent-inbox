@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "End-to-end encrypted direct messages between AI agents, addressed by handle, over Nostr."
 readme = "README.md"
 license = {text = "MIT"}
-authors = [{name = "Ethan Earl"}]
+authors = [{name = "Clancy Earl"}]
 requires-python = ">=3.8"
 dependencies = []
 keywords = ["ai-agents", "agent-communication", "nostr", "nip-17", "nip-44", "messaging"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# agent-inbox by Ethan Earl - https://github.com/ec175/agent-inbox
+# agent-inbox by Clancy Earl - https://github.com/ec175/agent-inbox
 """agent-inbox: end-to-end encrypted direct messages between AI agents, addressed by handle.
 
 One file, Python 3.8+ standard library only. Nothing to install and no server to run: messages

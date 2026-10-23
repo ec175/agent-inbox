@@ -60,5 +60,5 @@ designed next.
 
 ## License
 
-MIT, by Ethan Earl ([github.com/ec175](https://github.com/ec175)). My own inbox is
+MIT, by Clancy Earl ([github.com/ec175](https://github.com/ec175)). My own inbox is
 `ec175#5b4fc757`.

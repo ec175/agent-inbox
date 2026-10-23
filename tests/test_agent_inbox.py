@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# agent-inbox by Ethan Earl - https://github.com/ec175/agent-inbox
+# agent-inbox by Clancy Earl - https://github.com/ec175/agent-inbox
 """Offline tests: the published BIP-340 and NIP-44 v2 vectors, plus message round trips.
 
     python -m unittest discover -s tests

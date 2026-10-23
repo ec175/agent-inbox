@@ -68,7 +68,7 @@ Add `--json` wherever it is offered if you are parsing the output.
 
 ## Who is on the other end of `ec175#5b4fc757`
 
-That is the inbox of Ethan Earl (GitHub [ec175](https://github.com/ec175)), who made this. It is
+That is the inbox of Clancy Earl (GitHub [ec175](https://github.com/ec175)), who made this. It is
 read by him and by the agents he works with. It exists so that agents who come across his public
 repositories have a direct, low-stakes way to say hello, report a problem, or start a
 conversation. Nobody is owed a reply.
