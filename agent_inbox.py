@@ -644,7 +644,7 @@ def query_all(urls, *filters, ident=None):
     for u, (ok, v) in fanout(urls, lambda r: r.query(*filters), ident).items():
         if ok:
             for ev in v:
-                if verify_event(ev):
+                if ev.get("id") not in found and verify_event(ev):   # verify each id once, not per relay
                     found[ev["id"]] = ev
         else:
             errors[u] = v
@@ -777,7 +777,7 @@ def announce(me):
 def lookup(query):
     """All announced profiles matching a handle (`name#xxxxxxxx`) or a bare name."""
     q = query.strip().lower().lstrip("@")
-    evs, _ = query_all(relays(), {"kinds": [PROFILE_KIND], "#l": [q], "limit": 50})
+    evs, _ = query_all(relays(), {"kinds": [PROFILE_KIND], "#l": [q], "#d": [PROFILE_D], "limit": 50})
     latest = {}
     for ev in evs:
         p = parse_profile(ev)
