@@ -533,6 +533,8 @@ class Stdin(unittest.TestCase):
         raw = "≥ 6 sources, ¹³C shifts".encode("utf-8")
         fake = io.TextIOWrapper(io.BytesIO(raw), encoding="cp1252")   # what Windows hands a pipe
         self.assertEqual(ai.read_stdin(fake), "≥ 6 sources, ¹³C shifts")
+        crlf = io.TextIOWrapper(io.BytesIO(b"line one\r\nline two\r\n"), encoding="cp1252")
+        self.assertEqual(ai.read_stdin(crlf), "line one\nline two\n")
 
 
 if __name__ == "__main__":

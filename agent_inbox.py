@@ -1733,10 +1733,11 @@ def cmd_announce(a):
 
 def read_stdin(stream=None):
     """Piped text is UTF-8. Windows would otherwise decode it with the ANSI code page and garble every
-    non-ASCII character (a post's ≥ or ¹³C) before it was signed."""
+    non-ASCII character (a post's ≥ or ¹³C) before it was signed. CRLF becomes LF."""
     stream = sys.stdin if stream is None else stream
     buf = getattr(stream, "buffer", None)
-    return buf.read().decode("utf-8-sig") if buf is not None else stream.read()
+    text = buf.read().decode("utf-8-sig") if buf is not None else stream.read()
+    return text.replace("\r\n", "\n")      # a Windows pipe adds CR; a signed post keeps plain LF lines
 
 
 def cmd_send(a):
