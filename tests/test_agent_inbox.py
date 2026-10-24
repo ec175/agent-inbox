@@ -4,13 +4,17 @@
 
     python -m unittest discover -s tests
 """
+import base64
 import csv
 import hashlib
 import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -343,6 +347,192 @@ class Viewer(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+def _read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+class AESGCM(unittest.TestCase):
+    """FIPS-197 and the AES-256 cases of the GCM spec (McGrew & Viega, test cases 13-16)."""
+    K = bytes.fromhex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308")
+    IV = bytes.fromhex("cafebabefacedbaddecaf888")
+    P = bytes.fromhex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+                      "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")
+    C = bytes.fromhex("522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa"
+                      "8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015ad")
+
+    def test_fips197_block(self):
+        self.assertEqual(ai.aes256_encrypt_block(bytes(range(32)), bytes.fromhex("00112233445566778899aabbccddeeff")).hex(),
+                         "8ea2b7ca516745bfeafc49904b496089")
+
+    def test_gcm_vectors(self):
+        z, n = bytes(32), bytes(12)
+        self.assertEqual(ai.aes_gcm_encrypt(z, n, b"").hex(), "530f8afbc74536b9a963b4f1c4cb738b")
+        self.assertEqual(ai.aes_gcm_encrypt(z, n, bytes(16)).hex(),
+                         "cea7403d4d606b6e074ec5d3baf39d18" "d0d1c8a799996bf0265b98b5d48ab919")
+        self.assertEqual(ai.aes_gcm_encrypt(self.K, self.IV, self.P), self.C + bytes.fromhex("b094dac5d93471bdec1a502270e3cc6c"))
+        aad = bytes.fromhex("feedfacedeadbeeffeedfacedeadbeefabaddad2")
+        self.assertEqual(ai.aes_gcm_encrypt(self.K, self.IV, self.P[:60], aad),
+                         self.C[:60] + bytes.fromhex("76fc6ece0f4e1768cddf8853bb2d551b"))
+
+    def test_table_ghash_matches_bitwise(self):
+        h = int.from_bytes(os.urandom(16), "big")
+        tables = ai._ghash_tables(h)
+        for _ in range(20):
+            x = int.from_bytes(os.urandom(16), "big")
+            y = 0
+            for pos in range(16):
+                y ^= tables[pos][(x >> (8 * (15 - pos))) & 0xFF]
+            self.assertEqual(y, ai._gf_mul(x, h))
+
+    def test_round_trip_and_tamper(self):
+        key, nonce = os.urandom(32), os.urandom(12)
+        for size in (0, 1, 15, 16, 17, 1000):
+            data = os.urandom(size)
+            blob = ai.aes_gcm_encrypt(key, nonce, data)
+            self.assertEqual(ai.aes_gcm_decrypt(key, nonce, blob), data)
+        bad = bytearray(ai.aes_gcm_encrypt(key, nonce, b"hello world"))
+        bad[3] ^= 1
+        with self.assertRaises(ValueError):
+            ai.aes_gcm_decrypt(key, nonce, bytes(bad))
+        with self.assertRaises(ValueError):
+            ai.aes_gcm_decrypt(os.urandom(32), nonce, ai.aes_gcm_encrypt(key, nonce, b"x"))
+
+
+class _Blossom(BaseHTTPRequestHandler):
+    """A minimal BUD-01/02 server: checks the kind-24242 authorization, stores by sha256."""
+    store = {}
+
+    def log_message(self, *a):
+        pass
+
+    def do_PUT(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        sha = hashlib.sha256(body).hexdigest()
+        try:
+            auth = self.headers.get("Authorization", "")
+            ev = json.loads(base64.b64decode(auth.split(" ", 1)[1]))
+            tags = {t[0]: t[1] for t in ev["tags"]}
+            assert auth.startswith("Nostr ") and ai.verify_event(ev) and ev["kind"] == 24242
+            assert tags["t"] == "upload" and tags["x"] == sha and int(tags["expiration"]) > time.time()
+        except Exception:
+            self.send_response(401)
+            self.end_headers()
+            return
+        self.store[sha] = body
+        desc = json.dumps({"url": "http://127.0.0.1:%d/%s" % (self.server.server_port, sha), "sha256": sha,
+                           "size": len(body), "type": "application/octet-stream", "uploaded": int(time.time())}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(desc)))
+        self.end_headers()
+        self.wfile.write(desc)
+
+    def do_GET(self):
+        body = self.store.get(self.path.strip("/"))
+        self.send_response(200 if body is not None else 404)
+        self.end_headers()
+        if body is not None:
+            self.wfile.write(body)
+
+
+class Files(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ[ai.HOME_ENV] = self.tmp.name
+        self.a = ai.Identity(ai.new_secret(), "alice")
+        self.b = ai.Identity(ai.new_secret(), "bob")
+        self.sent = []
+        self._orig = (ai.publish_all, ai.dm_relays_of)
+        ai.publish_all = lambda urls, ev, ident=None: (self.sent.append(ev), {"wss://test": (True, "")})[1]
+        ai.dm_relays_of = lambda pk: []
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), _Blossom)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.server = "http://127.0.0.1:%d" % self.srv.server_port
+
+    def tearDown(self):
+        ai.publish_all, ai.dm_relays_of = self._orig
+        self.srv.shutdown()
+        self.srv.server_close()
+        os.environ.pop(ai.HOME_ENV, None)
+        self.tmp.cleanup()
+
+    def _file(self, size, name="kit.zip"):
+        p = os.path.join(self.tmp.name, name)
+        with open(p, "wb") as f:
+            f.write(os.urandom(size))
+        return p
+
+    def _deliver(self, path, **kw):
+        res, rumor, info = ai.send_file(self.a, self.b.pk, path, **kw)
+        got = ai.unwrap_message(self.b, self.sent[-1])
+        return got, info
+
+    def test_small_file_travels_inline(self):
+        path = self._file(5000)
+        got, info = self._deliver(path)
+        self.assertEqual(got["from"], self.a.pk)
+        self.assertTrue(got["file"]["url"].startswith("data:"))
+        self.assertIn("[file] kit.zip", got["text"])
+        out = ai.fetch_file(got["file"], os.path.join(self.tmp.name, "out"))
+        self.assertEqual(_read(out), _read(path))
+
+    def test_large_file_goes_as_a_blob(self):
+        path = self._file(40000)
+        got, info = self._deliver(path, servers=[self.server])
+        self.assertTrue(got["file"]["url"].startswith(self.server))
+        stored = _Blossom.store[got["file"]["x"]]
+        self.assertNotIn(_read(path)[:64], stored)          # the server only ever sees ciphertext
+        out = ai.fetch_file(got["file"], os.path.join(self.tmp.name, "out"))
+        self.assertEqual(_read(out), _read(path))
+
+    def test_kind15_tags(self):
+        got, info = self._deliver(self._file(100), )
+        rumor_kind = json.loads(ai.nip44_decrypt(
+            json.loads(ai.nip44_decrypt(self.sent[-1]["content"], ai.conversation_key(
+                self.b.sk, bytes.fromhex(self.sent[-1]["pubkey"]))))["content"],
+            ai.conversation_key(self.b.sk, bytes.fromhex(self.a.pk))))
+        self.assertEqual(rumor_kind["kind"], 15)
+        names = [t[0] for t in rumor_kind["tags"]]
+        for t in ("p", "file-type", "encryption-algorithm", "decryption-key", "decryption-nonce", "x", "ox", "size"):
+            self.assertIn(t, names)
+
+    def test_tampered_blob_refused(self):
+        got, _ = self._deliver(self._file(40000), servers=[self.server])
+        x = got["file"]["x"]
+        _Blossom.store[x] = _Blossom.store[x][:-1] + bytes([_Blossom.store[x][-1] ^ 1])
+        with self.assertRaises(SystemExit):
+            ai.fetch_file(got["file"], os.path.join(self.tmp.name, "out"))
+
+    def test_unauthorised_upload_refused_by_server(self):
+        with self.assertRaises(SystemExit):   # a bad authorization: the server answers 401, no server took it
+            orig = ai.blossom_auth
+            ai.blossom_auth = lambda me, sha, verb="upload", ttl=600: "Nostr e30="
+            try:
+                ai.blossom_upload(self.a, b"x" * 100, [self.server])
+            finally:
+                ai.blossom_auth = orig
+
+    def test_hostile_name_is_sanitised(self):
+        got, info = self._deliver(self._file(10, name="evil.zip"))
+        got["file"]["name"] = "../../../windows/system32/x.exe"
+        out = ai.fetch_file(got["file"], os.path.join(self.tmp.name, "out"))
+        self.assertTrue(os.path.realpath(out).startswith(os.path.realpath(os.path.join(self.tmp.name, "out"))))
+
+    def test_malformed_file_message_rejected(self):
+        rumor = {"pubkey": self.a.pk, "created_at": 1, "kind": 15, "tags": [["p", self.b.pk]], "content": "https://x/y"}
+        with self.assertRaises(ValueError):
+            ai.parse_file_rumor(rumor)
+
+
+
+class Stdin(unittest.TestCase):
+    def test_piped_text_is_utf8(self):
+        import io
+        raw = "≥ 6 sources, ¹³C shifts".encode("utf-8")
+        fake = io.TextIOWrapper(io.BytesIO(raw), encoding="cp1252")   # what Windows hands a pipe
+        self.assertEqual(ai.read_stdin(fake), "≥ 6 sources, ¹³C shifts")
 
 
 if __name__ == "__main__":

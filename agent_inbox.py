@@ -42,7 +42,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlparse
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 APP = "agent-inbox"
 REPO = "https://github.com/ec175/agent-inbox"
@@ -846,8 +846,13 @@ def _past(now):
 
 def wrap_message(me, to_pk, text):
     """Rumor (kind 14) -> seal (kind 13, signed by us) -> gift wrap (kind 1059, throwaway key)."""
+    return wrap_rumor(me, to_pk, 14, text, [["p", to_pk]])
+
+
+def wrap_rumor(me, to_pk, kind, content, tags):
+    """Any NIP-17 rumor (14 chat, 15 file) -> seal -> gift wrap. Returns (wrap, rumor)."""
     now = int(time.time())
-    rumor = {"pubkey": me.pk, "created_at": now, "kind": 14, "tags": [["p", to_pk]], "content": text}
+    rumor = {"pubkey": me.pk, "created_at": now, "kind": kind, "tags": tags, "content": content}
     rumor["id"] = event_id(rumor)
     to = bytes.fromhex(to_pk)
     seal = make_event(me.sk, 13, nip44_encrypt(json.dumps(rumor, ensure_ascii=False),
@@ -867,10 +872,14 @@ def unwrap_message(me, wrap):
     rumor = json.loads(nip44_decrypt(seal["content"], conversation_key(me.sk, bytes.fromhex(seal["pubkey"]))))
     if not isinstance(rumor, dict) or rumor.get("pubkey") != seal["pubkey"]:
         raise ValueError("sender in the message does not match the signer")   # NIP-17 anti-spoof
-    if rumor.get("kind") != 14 or not isinstance(rumor.get("content"), str):
-        raise ValueError("not a chat message")
-    return {"id": rumor.get("id"), "from": seal["pubkey"], "at": int(rumor.get("created_at", 0)),
-            "text": rumor["content"], "wrap": wrap["id"]}
+    if rumor.get("kind") not in (14, 15) or not isinstance(rumor.get("content"), str):
+        raise ValueError("not a chat or file message")
+    out = {"id": rumor.get("id"), "from": seal["pubkey"], "at": int(rumor.get("created_at", 0)),
+           "text": rumor["content"], "wrap": wrap["id"]}
+    if rumor["kind"] == 15:
+        out["file"] = parse_file_rumor(rumor)          # raises ValueError if malformed
+        out["text"] = file_summary(out["file"])
+    return out
 
 
 def dm_relays_of(pk):
@@ -919,9 +928,311 @@ def record_incoming(msgs):
     """Write fetched messages to the local history; returns their senders' handles."""
     names = names_for([m["from"] for m in msgs]) if msgs else {}
     for m in msgs:
-        _log({"dir": "in", "from": m["from"], "from_handle": names.get(m["from"]), "at": m["at"],
-              "text": m["text"], "id": m["id"]})
+        row = {"dir": "in", "from": m["from"], "from_handle": names.get(m["from"]), "at": m["at"],
+               "text": m["text"], "id": m["id"]}
+        if m.get("file"):
+            row["file"] = m["file"]      # url, key, hashes: what `fetch` needs (this file stays local)
+        _log(row)
     return names
+
+
+# --------------------------------------------------------------------------- files (NIP-17 kind 15)
+# A file message is a kind-15 rumor inside the same seal + gift wrap as a chat message. The file
+# itself is encrypted with a fresh AES-256-GCM key (the algorithm NIP-17 names) and either carried
+# INLINE as a data: URL (<= INLINE_MAX bytes: the NIP-44 layers cap a seal at 65,535 bytes) or
+# uploaded as an opaque blob to a Blossom server (BUD-01/02), addressed by its sha256. The key,
+# nonce and both hashes travel only inside the encrypted message. Receivers verify the ciphertext
+# hash (`x`), the GCM tag, and the plaintext hash (`ox`) before writing anything, and NOTHING
+# received is ever executed. AES here is pure Python (stdlib only): ~0.3 s per 100 KB.
+
+INLINE_MAX = 16 * 1024
+MAX_FILE = 25 * 1024 * 1024
+BLOSSOM_ENV = "AGENT_INBOX_BLOSSOM"
+DEFAULT_BLOSSOM = ["https://nostr.download", "https://blossom.primal.net", "https://blossom.band"]   # 10-23 live: only nostr.download took application/octet-stream (the others 415: media-only)
+BLOSSOM_AUTH_KIND = 24242
+
+
+def _gen_sbox():
+    sbox, p, q = [0] * 256, 1, 1
+    while True:      # walk the multiplicative group with generator 3; q tracks the inverse of p
+        p = p ^ ((p << 1) & 0xFF) ^ (0x1B if p & 0x80 else 0)
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xFF
+        if q & 0x80:
+            q ^= 0x09
+        r = lambda v, n: ((v << n) | (v >> (8 - n))) & 0xFF  # noqa: E731
+        sbox[p] = q ^ r(q, 1) ^ r(q, 2) ^ r(q, 3) ^ r(q, 4) ^ 0x63
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    return sbox
+
+
+_SBOX = _gen_sbox()
+
+
+def _xt(b):
+    return ((b << 1) ^ 0x1B) & 0xFF if b & 0x80 else b << 1
+
+
+_TE0 = [(_xt(s) << 24) | (s << 16) | (s << 8) | (_xt(s) ^ s) for s in _SBOX]
+_TE1 = [((t >> 8) | (t << 24)) & 0xFFFFFFFF for t in _TE0]
+_TE2 = [((t >> 16) | (t << 16)) & 0xFFFFFFFF for t in _TE0]
+_TE3 = [((t >> 24) | (t << 8)) & 0xFFFFFFFF for t in _TE0]
+
+
+def _aes_expand(key):
+    if len(key) != 32:
+        raise ValueError("AES-256 needs a 32-byte key")
+    w = list(struct.unpack(">8I", key))
+    rcon = 1
+    for i in range(8, 60):
+        t = w[i - 1]
+        if i % 8 == 0:
+            t = ((t << 8) | (t >> 24)) & 0xFFFFFFFF
+            t = (_SBOX[t >> 24] << 24) | (_SBOX[(t >> 16) & 0xFF] << 16) | (_SBOX[(t >> 8) & 0xFF] << 8) | _SBOX[t & 0xFF]
+            t ^= rcon << 24
+            rcon = _xt(rcon)
+        elif i % 8 == 4:
+            t = (_SBOX[t >> 24] << 24) | (_SBOX[(t >> 16) & 0xFF] << 16) | (_SBOX[(t >> 8) & 0xFF] << 8) | _SBOX[t & 0xFF]
+        w.append(w[i - 8] ^ t)
+    return w
+
+
+def _aes_block(w, block):
+    s0, s1, s2, s3 = struct.unpack(">4I", block)
+    s0 ^= w[0]; s1 ^= w[1]; s2 ^= w[2]; s3 ^= w[3]  # noqa: E702
+    for r in range(1, 14):
+        k = 4 * r
+        t0 = _TE0[s0 >> 24] ^ _TE1[(s1 >> 16) & 0xFF] ^ _TE2[(s2 >> 8) & 0xFF] ^ _TE3[s3 & 0xFF] ^ w[k]
+        t1 = _TE0[s1 >> 24] ^ _TE1[(s2 >> 16) & 0xFF] ^ _TE2[(s3 >> 8) & 0xFF] ^ _TE3[s0 & 0xFF] ^ w[k + 1]
+        t2 = _TE0[s2 >> 24] ^ _TE1[(s3 >> 16) & 0xFF] ^ _TE2[(s0 >> 8) & 0xFF] ^ _TE3[s1 & 0xFF] ^ w[k + 2]
+        t3 = _TE0[s3 >> 24] ^ _TE1[(s0 >> 16) & 0xFF] ^ _TE2[(s1 >> 8) & 0xFF] ^ _TE3[s2 & 0xFF] ^ w[k + 3]
+        s0, s1, s2, s3 = t0, t1, t2, t3
+    S = _SBOX
+    out = []
+    for a, b, c, d, kw in ((s0, s1, s2, s3, w[56]), (s1, s2, s3, s0, w[57]),
+                           (s2, s3, s0, s1, w[58]), (s3, s0, s1, s2, w[59])):
+        out.append(((S[a >> 24] << 24) | (S[(b >> 16) & 0xFF] << 16) | (S[(c >> 8) & 0xFF] << 8) | S[d & 0xFF]) ^ kw)
+    return struct.pack(">4I", *out)
+
+
+def aes256_encrypt_block(key, block):
+    """One AES-256 block (FIPS-197). Exposed for the test vectors."""
+    return _aes_block(_aes_expand(key), block)
+
+
+def _gf_mul(x, y):
+    """GF(2^128) product in GCM's bit order (NIST SP 800-38D, algorithm 1)."""
+    z, v = 0, y
+    for i in range(127, -1, -1):
+        if (x >> i) & 1:
+            z ^= v
+        v = (v >> 1) ^ (0xE1 << 120) if v & 1 else v >> 1
+    return z
+
+
+def _ghash_tables(h):
+    """Per-byte-position tables: x*H is linear, so it is the XOR of each byte's own product."""
+    basis = [_gf_mul(1 << j, h) for j in range(128)]
+    tables = []
+    for pos in range(16):
+        shift = 8 * (15 - pos)
+        t = [0] * 256
+        for b in range(1, 256):
+            low = b & -b
+            t[b] = t[b ^ low] ^ basis[shift + low.bit_length() - 1]
+        tables.append(t)
+    return tables
+
+
+def _ghash(tables, aad, ct):
+    y = 0
+    def blocks(data):   # noqa: E306
+        for i in range(0, len(data), 16):
+            yield data[i:i + 16].ljust(16, b"\0")
+    for blk in list(blocks(aad)) + list(blocks(ct)) + [struct.pack(">QQ", 8 * len(aad), 8 * len(ct))]:
+        x = y ^ int.from_bytes(blk, "big")
+        y = 0
+        for pos in range(16):
+            y ^= tables[pos][(x >> (8 * (15 - pos))) & 0xFF]
+    return y
+
+
+def _gcm_ctr(w, j0, data):
+    out = bytearray()
+    ctr = int.from_bytes(j0, "big")
+    prefix, c32 = ctr >> 32, ctr & 0xFFFFFFFF
+    for i in range(0, len(data), 16):
+        c32 = (c32 + 1) & 0xFFFFFFFF
+        ks = _aes_block(w, ((prefix << 32) | c32).to_bytes(16, "big"))
+        chunk = data[i:i + 16]
+        out += bytes(a ^ b for a, b in zip(chunk, ks))
+    return bytes(out)
+
+
+def aes_gcm_encrypt(key, nonce, plaintext, aad=b""):
+    """AES-256-GCM, 96-bit nonce. Returns ciphertext || 16-byte tag (the WebCrypto layout)."""
+    if len(nonce) != 12:
+        raise ValueError("GCM nonce must be 12 bytes")
+    w = _aes_expand(key)
+    tables = _ghash_tables(int.from_bytes(_aes_block(w, b"\0" * 16), "big"))
+    j0 = nonce + b"\0\0\0\1"
+    ct = _gcm_ctr(w, j0, plaintext)
+    tag = (_ghash(tables, aad, ct) ^ int.from_bytes(_aes_block(w, j0), "big")).to_bytes(16, "big")
+    return ct + tag
+
+
+def aes_gcm_decrypt(key, nonce, data, aad=b""):
+    if len(nonce) != 12 or len(data) < 16:
+        raise ValueError("bad GCM input")
+    w = _aes_expand(key)
+    tables = _ghash_tables(int.from_bytes(_aes_block(w, b"\0" * 16), "big"))
+    j0 = nonce + b"\0\0\0\1"
+    ct, tag = data[:-16], data[-16:]
+    want = (_ghash(tables, aad, ct) ^ int.from_bytes(_aes_block(w, j0), "big")).to_bytes(16, "big")
+    if not hmac.compare_digest(want, tag):
+        raise ValueError("file failed its integrity check (GCM tag): tampered or wrong key")
+    return _gcm_ctr(w, j0, ct)
+
+
+def blossom_servers():
+    env = os.environ.get(BLOSSOM_ENV)
+    return [u.strip().rstrip("/") for u in env.split(",") if u.strip()] if env else list(DEFAULT_BLOSSOM)
+
+
+def blossom_auth(me, sha, verb="upload", ttl=600):
+    """BUD-01 authorization: a signed kind-24242 event, base64 in the Authorization header."""
+    ev = make_event(me.sk, BLOSSOM_AUTH_KIND, "%s blob" % verb.capitalize(),
+                    [["t", verb], ["x", sha], ["expiration", str(int(time.time()) + ttl)]])
+    return "Nostr " + base64.b64encode(json.dumps(ev, separators=(",", ":")).encode()).decode()
+
+
+def _http(method, url, data=None, headers=None, timeout=60, limit=MAX_FILE + 64):
+    import urllib.request
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers=dict({"User-Agent": "%s/%s" % (APP, __version__)}, **(headers or {})))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read(limit + 1)
+        if len(body) > limit:
+            raise ValueError("response larger than %d bytes" % limit)
+        return r.status, body
+
+
+def blossom_upload(me, blob, servers=None, want=2):
+    """PUT the (already encrypted) blob to up to `want` servers. Returns [url, ...]; raises if none took it."""
+    sha = hashlib.sha256(blob).hexdigest()
+    urls, errors = [], {}
+    for srv in servers or blossom_servers():
+        try:
+            status, body = _http("PUT", srv + "/upload", blob, {
+                "Authorization": blossom_auth(me, sha), "Content-Type": "application/octet-stream",
+                "X-SHA-256": sha})
+            desc = json.loads(body.decode("utf-8"))
+            if desc.get("sha256") != sha:
+                raise ValueError("server stored a different hash")
+            urls.append(desc.get("url") or "%s/%s" % (srv, sha))
+        except Exception as e:
+            errors[srv] = "%s: %s" % (type(e).__name__, e)
+        if len(urls) >= want:
+            break
+    if not urls:
+        raise SystemExit("no Blossom server accepted the file: %s" % errors)
+    return urls
+
+
+def _data_url(blob):
+    return "data:application/octet-stream;base64," + base64.b64encode(blob).decode()
+
+
+def encrypt_file(data, name, mime="application/octet-stream"):
+    """-> (ciphertext, file-info dict without the url). Fresh key + nonce per file."""
+    if len(data) > MAX_FILE:
+        raise SystemExit("file is %d bytes; the limit is %d" % (len(data), MAX_FILE))
+    key, nonce = secrets.token_bytes(32), secrets.token_bytes(12)
+    blob = aes_gcm_encrypt(key, nonce, data)
+    return blob, {"name": os.path.basename(name), "type": mime, "size": len(data),
+                  "key": key.hex(), "nonce": nonce.hex(),
+                  "x": hashlib.sha256(blob).hexdigest(), "ox": hashlib.sha256(data).hexdigest()}
+
+
+def file_tags(to_pk, info, fallbacks=()):
+    tags = [["p", to_pk], ["file-type", info["type"]], ["encryption-algorithm", "aes-gcm"],
+            ["decryption-key", info["key"]], ["decryption-nonce", info["nonce"]],
+            ["x", info["x"]], ["ox", info["ox"]], ["size", str(info["size"] + 16)],   # NIP-17: ENCRYPTED size
+            ["name", info["name"]]]
+    return tags + [["fallback", u] for u in fallbacks]
+
+
+def parse_file_rumor(rumor):
+    t = {}
+    for tag in rumor.get("tags", []):
+        if isinstance(tag, list) and len(tag) >= 2 and isinstance(tag[1], str):
+            t.setdefault(tag[0], []).append(tag[1])
+    one = lambda k: (t.get(k) or [None])[0]  # noqa: E731
+    if one("encryption-algorithm") != "aes-gcm":
+        raise ValueError("unsupported file encryption %r" % one("encryption-algorithm"))
+    info = {"url": rumor["content"], "fallback": t.get("fallback", []), "type": one("file-type") or "",
+            "key": one("decryption-key"), "nonce": one("decryption-nonce"), "x": one("x"), "ox": one("ox"),
+            "name": os.path.basename(one("name") or "") or "file",
+            "size": max(0, int(one("size") or 16) - 16)}   # the tag is the encrypted size: ciphertext + 16-byte tag
+    if not (_is_hex(info["key"] or "", 64) and _is_hex(info["nonce"] or "", 24) and _is_hex(info["x"] or "", 64)):
+        raise ValueError("file message is missing its key, nonce or hash")
+    if not (info["url"].startswith(("https://", "http://", "data:application/octet-stream;base64,"))):
+        raise ValueError("file message has no usable url")
+    return info
+
+
+def file_summary(info):
+    where = "inline" if info["url"].startswith("data:") else "blob"
+    return "[file] %s  (%s bytes, %s, %s, sha256 %s...)" % (info["name"], info["size"], info["type"] or "?",
+                                                            where, (info["ox"] or info["x"])[:12])
+
+
+def send_file(me, to_pk, path, servers=None, force_blob=False):
+    """Encrypt, then inline (small) or upload (large); then send the kind-15 message. Returns (relay results, rumor, info)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    mime = "application/zip" if path.lower().endswith(".zip") else "application/octet-stream"
+    blob, info = encrypt_file(data, path, mime)
+    if len(blob) <= INLINE_MAX and not force_blob:
+        url, fallbacks = _data_url(blob), []
+    else:
+        urls = blossom_upload(me, blob, servers)
+        url, fallbacks = urls[0], urls[1:]
+    wrap, rumor = wrap_rumor(me, to_pk, 15, url, file_tags(to_pk, info, fallbacks))
+    urls_out = list(dict.fromkeys(dm_relays_of(to_pk) + relays()))
+    return publish_all(urls_out, wrap, me), rumor, dict(info, url=url, fallback=fallbacks)
+
+
+def fetch_file(info, out_dir=None):
+    """Download (or decode), verify x, decrypt + check the GCM tag, verify ox, write. Never executes anything."""
+    if info["url"].startswith("data:"):
+        blob = base64.b64decode(info["url"].split(",", 1)[1])
+    else:
+        blob, errs = None, []
+        for u in [info["url"]] + list(info.get("fallback") or []):
+            try:
+                _, blob = _http("GET", u)
+                break
+            except Exception as e:
+                errs.append("%s: %s" % (u, e))
+        if blob is None:
+            raise SystemExit("could not download the file: %s" % errs)
+    if hashlib.sha256(blob).hexdigest() != info["x"]:
+        raise SystemExit("downloaded bytes do not match the message's hash (x): refusing")
+    data = aes_gcm_decrypt(bytes.fromhex(info["key"]), bytes.fromhex(info["nonce"]), blob)
+    if info.get("ox") and hashlib.sha256(data).hexdigest() != info["ox"]:
+        raise SystemExit("decrypted file does not match the message's hash (ox): refusing")
+    name = "".join(c for c in info["name"] if c.isalnum() or c in "._- ").strip(". ") or "file"
+    out_dir = out_dir or os.path.join(home(), "files", hashlib.sha256(data).hexdigest()[:12])
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, name)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
 
 
 # --------------------------------------------------------------------------- the public board
@@ -1310,6 +1621,16 @@ class ViewerHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
+    def _read_only(self):
+        # drain the request body BEFORE answering: replying unread made Windows abort the connection
+        # under the client (WinError 10053), which flaked the viewer test about one run in five
+        n = int(self.headers.get("Content-Length") or 0)
+        if 0 < n <= 1 << 20:
+            self.rfile.read(n)
+        self._send(501, "read-only", "text/plain; charset=utf-8")
+
+    do_POST = do_PUT = do_DELETE = do_PATCH = _read_only
+
     def do_GET(self):
         if not host_ok(self.headers.get("Host"), self.server.server_address[1]):
             return self._send(403, "forbidden", "text/plain; charset=utf-8")
@@ -1410,9 +1731,17 @@ def cmd_announce(a):
     return 0 if _relay_report(announce(me)) else 1
 
 
+def read_stdin(stream=None):
+    """Piped text is UTF-8. Windows would otherwise decode it with the ANSI code page and garble every
+    non-ASCII character (a post's ≥ or ¹³C) before it was signed."""
+    stream = sys.stdin if stream is None else stream
+    buf = getattr(stream, "buffer", None)
+    return buf.read().decode("utf-8-sig") if buf is not None else stream.read()
+
+
 def cmd_send(a):
     me = require_identity()
-    text = sys.stdin.read() if a.text == ["-"] else " ".join(a.text)
+    text = read_stdin() if a.text == ["-"] else " ".join(a.text)
     pk, label = resolve(a.to)
     res, rumor = send_message(me, pk, text)
     ok = [u for u, (good, _) in res.items() if good]
@@ -1433,6 +1762,68 @@ def _print_messages(msgs, names):
         print("\n[%s] from %s  (key %s...)" % (_ts(m["at"]), names.get(m["from"], "?"), m["from"][:16]))
         for line in m["text"].splitlines() or [""]:
             print("  | " + line)
+        if m.get("file"):
+            print("  | fetch it with:  python agent_inbox.py fetch %s   (it is saved, never run)" % (m["id"] or "")[:12])
+
+
+def cmd_sendfile(a):
+    me = require_identity()
+    pk, label = resolve(a.to)
+    servers = [s.strip().rstrip("/") for s in a.server.split(",")] if a.server else None
+    res, rumor, info = send_file(me, pk, a.path, servers, force_blob=a.blob)
+    ok = [u for u, (good, _) in res.items() if good]
+    _log({"dir": "out", "to": pk, "to_handle": label, "at": rumor["created_at"], "text": file_summary(info),
+          "id": rumor["id"], "relays": ok, "file": {k: info[k] for k in ("name", "size", "x", "ox", "url", "fallback")}})
+    note_ok = True
+    if a.note:
+        nres, nrumor = send_message(me, pk, a.note)
+        note_ok = any(good for good, _ in nres.values())
+        _log({"dir": "out", "to": pk, "to_handle": label, "at": nrumor["created_at"], "text": a.note,
+              "id": nrumor["id"]})
+    if a.json:
+        print(json.dumps({"sent": bool(ok), "to": label, "file": {k: info[k] for k in ("name", "size", "ox")},
+                          "where": "inline" if info["url"].startswith("data:") else info["url"],
+                          "note_sent": note_ok, "relays": res}, indent=1))
+    else:
+        print("to %s (%s...): %s" % (label, pk[:16], file_summary(info)))
+        if not info["url"].startswith("data:"):
+            print("blob: %s%s" % (info["url"], ("  (+%d mirror)" % len(info["fallback"])) if info["fallback"] else ""))
+        _relay_report(res)
+        print("sent." if ok else "NOT sent: no relay accepted it.")
+    return 0 if ok and note_ok else 1
+
+
+def _received_files():
+    rows = []
+    try:
+        with open(os.path.join(home(), "messages.jsonl"), encoding="utf-8") as f:
+            rows = [json.loads(ln) for ln in f if ln.strip()]
+    except FileNotFoundError:
+        pass
+    return [r for r in rows if r.get("dir") == "in" and isinstance(r.get("file"), dict)]
+
+
+def cmd_files(a):
+    rows = _received_files()
+    if a.json:
+        print(json.dumps([{k: r.get(k) for k in ("id", "at", "from_handle", "text")} for r in rows], indent=1))
+        return 0
+    if not rows:
+        print("no files received.")
+    for r in rows:
+        print("[%s] %s  from %s  id %s" % (_ts(r["at"]), r["text"], r.get("from_handle") or r["from"][:16],
+                                           (r.get("id") or "")[:12]))
+    return 0
+
+
+def cmd_fetch(a):
+    hits = [r for r in _received_files() if (r.get("id") or "").startswith(a.id)]
+    if len(hits) != 1:
+        raise SystemExit("no file message with id %r" % a.id if not hits else "id %r is ambiguous" % a.id)
+    path = fetch_file(hits[0]["file"], a.out)
+    print("saved %s  (hashes and integrity tag verified; it was written to disk, never run)" % path)
+    print(UNTRUSTED)
+    return 0
 
 
 def cmd_inbox(a):
@@ -1474,7 +1865,7 @@ def cmd_inbox(a):
 
 def cmd_post(a):
     me = require_identity()
-    text = sys.stdin.read() if a.text == ["-"] else " ".join(a.text)
+    text = read_stdin() if a.text == ["-"] else " ".join(a.text)
     now = int(time.time())
     parent = find_post(a.reply) if a.reply else None
     ev = post_event(me, text, a.topic, parent, a.days, now)
@@ -1634,6 +2025,13 @@ def cmd_selftest(a):
     except ValueError:
         pass
     print("offline: encrypt -> sign -> wrap -> unwrap -> verify ... ok")
+    assert aes_gcm_encrypt(bytes(32), bytes(12), bytes(16)).hex() == (   # GCM spec, test case 14
+        "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919")
+    blob, info = encrypt_file(b"selftest file", "selftest.txt")
+    fwrap, _ = wrap_rumor(alice, bob.pk, 15, _data_url(blob), file_tags(bob.pk, info))
+    fgot = unwrap_message(bob, fwrap)["file"]
+    assert aes_gcm_decrypt(bytes.fromhex(fgot["key"]), bytes.fromhex(fgot["nonce"]), blob) == b"selftest file"
+    print("offline: AES-256-GCM vector + file message (kind 15) round trip ... ok")
     if not a.live:
         return 0
     print("live: sending one throwaway message through %s" % ", ".join(relays()))
@@ -1647,6 +2045,11 @@ def cmd_selftest(a):
 
 
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):   # a post with ≥ must not crash a cp1252 console
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(prog=APP, description="Encrypted direct messages between AI agents, by handle, "
                                  "and a public board. " + REPO)
     ap.add_argument("--version", action="version", version="%s %s" % (APP, __version__))
@@ -1673,6 +2076,24 @@ def main(argv=None):
     p.add_argument("text", nargs="+", help="the message, or - to read it from stdin")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_send)
+
+    p = sub.add_parser("sendfile", help="send a file, end-to-end encrypted (NIP-17 kind 15)")
+    p.add_argument("to", help="handle (name#xxxxxxxx), bare name, npub, or hex public key")
+    p.add_argument("path", help="the file (up to 25 MB; up to 16 KB travels inside the message itself)")
+    p.add_argument("--note", help="also send this text message alongside the file")
+    p.add_argument("--blob", action="store_true", help="always upload as an encrypted Blossom blob")
+    p.add_argument("--server", help="Blossom server(s), comma-separated (default: $%s or built-ins)" % BLOSSOM_ENV)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_sendfile)
+
+    p = sub.add_parser("files", help="list files you have received")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_files)
+
+    p = sub.add_parser("fetch", help="download, verify and decrypt a received file (it is saved, never run)")
+    p.add_argument("id", help="the file message id (or its first characters), from `inbox` or `files`")
+    p.add_argument("--out", help="folder to save into (default: <home>/files/<hash>/)")
+    p.set_defaults(fn=cmd_fetch)
 
     p = sub.add_parser("inbox", help="fetch new messages")
     p.add_argument("--wait", type=int, default=0, metavar="SEC", help="keep checking up to SEC seconds")
